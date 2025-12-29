@@ -1,5 +1,9 @@
 import argparse
+import json
 import os
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Dict, Iterable, List, Optional, Tuple
 
 from google.auth.transport.requests import Request
@@ -11,12 +15,11 @@ from googleapiclient.errors import HttpError
 SCOPES = ["https://www.googleapis.com/auth/drive"]
 CREDENTIALS_DIR = "credentials"
 TOKEN_DIR = "token"
+thread_local = threading.local()
 
 
-def get_drive_service(credentials_path: str, token_path: str):
-    """
-    Build an authenticated Drive API client, prompting the user once for OAuth consent.
-    """
+def load_credentials(credentials_path: str, token_path: str) -> Credentials:
+    """Load and refresh OAuth credentials, prompting for consent if needed."""
     creds = None
     token_dir = os.path.dirname(token_path)
     if token_dir:
@@ -31,7 +34,26 @@ def get_drive_service(credentials_path: str, token_path: str):
             creds = flow.run_local_server(port=0)
         with open(token_path, "w", encoding="utf-8") as token_file:
             token_file.write(creds.to_json())
+    return creds
+
+
+def get_drive_service(credentials_path: str, token_path: str):
+    """
+    Build an authenticated Drive API client, prompting the user once for OAuth consent.
+    """
+    creds = load_credentials(credentials_path, token_path)
     return build("drive", "v3", credentials=creds, cache_discovery=False)
+
+
+def format_duration(seconds: float) -> str:
+    seconds = int(seconds)
+    if seconds < 60:
+        return f"{seconds}s"
+    minutes, sec = divmod(seconds, 60)
+    if minutes < 60:
+        return f"{minutes}m{sec:02d}s"
+    hours, minutes = divmod(minutes, 60)
+    return f"{hours}h{minutes:02d}m"
 
 
 def find_folder_id(service, folder_name: str, folder_id: Optional[str]) -> str:
@@ -260,6 +282,23 @@ def main():
         help="If set, uses target credentials to accept pending ownership requests automatically.",
     )
     parser.add_argument("--dry-run", action="store_true", help="List actions without transferring.")
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=5,
+        help="Number of parallel workers for transfers (defaults to 5).",
+    )
+    parser.add_argument(
+        "--scan-heartbeat",
+        type=int,
+        default=5,
+        help="Seconds between scan progress updates while enumerating files (default 5).",
+    )
+    parser.add_argument(
+        "--expected-total",
+        type=int,
+        help="Optional expected total file count to show % progress and ETA during scan.",
+    )
     args = parser.parse_args()
 
     if not args.folder_name and not args.folder_id:
@@ -271,8 +310,11 @@ def main():
     if not os.path.exists(owner_credentials):
         raise SystemExit(f"Owner credentials not found at {owner_credentials}")
 
-    service = get_drive_service(owner_credentials, owner_token)
-    target_service = None
+    owner_creds = load_credentials(owner_credentials, owner_token)
+    owner_creds_json = owner_creds.to_json()
+    service = build("drive", "v3", credentials=owner_creds, cache_discovery=False)
+
+    target_creds_json = None
     if args.auto_accept:
         if not args.target_credentials:
             target_credentials = os.path.join(CREDENTIALS_DIR, args.target_email)
@@ -281,7 +323,8 @@ def main():
         if not os.path.exists(target_credentials):
             raise SystemExit(f"Target credentials not found at {target_credentials}")
         target_token = args.target_token or os.path.join(TOKEN_DIR, f"{args.target_email}.json")
-        target_service = get_drive_service(target_credentials, target_token)
+        target_creds = load_credentials(target_credentials, target_token)
+        target_creds_json = target_creds.to_json()
 
     root_id = find_folder_id(service, args.folder_name, args.folder_id)
 
@@ -299,6 +342,13 @@ def main():
     }
     failures: List[str] = []
 
+    work_items: List[Tuple[str, str]] = []
+
+    scan_start = time.time()
+    last_heartbeat = scan_start
+    expected_total = args.expected_total if args.expected_total and args.expected_total > 0 else None
+    print("Scanning for files...", flush=True)
+
     for file_obj, rel_path in walk_files(service, root_id):
         stats["scanned"] += 1
         skip_reason = should_skip(file_obj)
@@ -311,29 +361,124 @@ def main():
             print(f"[DRY RUN] Would process: {path_str} ({file_obj['id']})")
             continue
 
-        status = None
+        work_items.append((file_obj["id"], path_str))
+
+        now = time.time()
+        if now - last_heartbeat >= args.scan_heartbeat:
+            elapsed = now - scan_start
+            rate = stats["scanned"] / elapsed if elapsed > 0 else 0.0
+            msg = (
+                f"Scanning... {stats['scanned']} items seen in {format_duration(elapsed)} "
+                f"({rate:.2f} items/s)"
+            )
+            if expected_total:
+                pct = min(100.0, (stats["scanned"] / expected_total) * 100.0)
+                remaining = max(expected_total - stats["scanned"], 0)
+                eta = format_duration(remaining / rate) if rate > 0 else "?"
+                msg += f" | {pct:.1f}% (~ETA {eta} if total={expected_total})"
+            print(msg, flush=True)
+            last_heartbeat = now
+
+    scan_elapsed = time.time() - scan_start
+    print(
+        f"Scan complete: {stats['scanned']} items seen in {format_duration(scan_elapsed)} "
+        f"({(stats['scanned']/scan_elapsed) if scan_elapsed>0 else 0:.2f} items/s)",
+        flush=True,
+    )
+
+    if args.dry_run or not work_items:
+        print("\nSummary:", flush=True)
+        for key, label in [
+            ("scanned", "Files scanned"),
+            ("transferred", "Ownership transferred"),
+            ("accepted", "Auto-accepted pending requests"),
+            ("pending_owner", "Pending owner requests"),
+            ("already_owner", "Already owned by target"),
+            ("skipped_shared_drive", "Skipped (shared drive items)"),
+            ("skipped_not_owned", "Skipped (not owned)"),
+            ("skipped_zero_quota", "Skipped (no storage quota usage)"),
+            ("skipped_zero_size", "Skipped (size 0)"),
+            ("errors", "Errors"),
+        ]:
+            print(f"- {label}: {stats[key]}", flush=True)
+
+        if failures:
+            print("\nFailures:", flush=True)
+            for item in failures:
+                print(f"- {item}", flush=True)
+        return
+
+    lock = threading.Lock()
+
+    def get_thread_services():
+        if not hasattr(thread_local, "owner_service"):
+            owner_thread_creds = Credentials.from_authorized_user_info(
+                json.loads(owner_creds_json), SCOPES
+            )
+            thread_local.owner_service = build(
+                "drive", "v3", credentials=owner_thread_creds, cache_discovery=False
+            )
+        if target_creds_json:
+            if not hasattr(thread_local, "target_service"):
+                target_thread_creds = Credentials.from_authorized_user_info(
+                    json.loads(target_creds_json), SCOPES
+                )
+                thread_local.target_service = build(
+                    "drive", "v3", credentials=target_thread_creds, cache_discovery=False
+                )
+        else:
+            thread_local.target_service = None
+        return thread_local.owner_service, getattr(thread_local, "target_service", None)
+
+    print(f"Starting transfers for {len(work_items)} files using {args.workers} workers", flush=True)
+
+    def worker(file_id: str, path_str: str):
+        owner_service, target_service = get_thread_services()
         try:
-            status = transfer_file_ownership(service, file_obj["id"], args.target_email)
+            status = transfer_file_ownership(owner_service, file_id, args.target_email)
             if status == "pending_owner" and target_service:
                 try:
-                    accept_status = accept_pending_transfer(
-                        target_service, file_obj["id"], args.target_email
-                    )
+                    accept_status = accept_pending_transfer(target_service, file_id, args.target_email)
                     if accept_status == "accepted":
                         status = "accepted"
                 except HttpError as err:
-                    failures.append(f"{path_str} ({file_obj['id']}): accept: {err}")
-                    stats["errors"] += 1
-                    print(f"error          {path_str}: accept: {err}")
-                    continue
-            stats[status] += 1
-            print(f"{status:14} {path_str}")
+                    with lock:
+                        stats["errors"] += 1
+                        failures.append(f"{path_str} ({file_id}): accept: {err}")
+                    print(f"error          {path_str}: accept: {err}", flush=True)
+                    return
+            with lock:
+                stats[status] += 1
+            print(f"{status:14} {path_str}", flush=True)
         except HttpError as err:
-            stats["errors"] += 1
-            failures.append(f"{path_str} ({file_obj['id']}): {err}")
-            print(f"error          {path_str}: {err}")
+            message = err.content.decode() if hasattr(err, "content") else str(err)
+            lower_msg = message.lower()
+            if "insufficientfilepermissions" in lower_msg and target_service:
+                try:
+                    accept_status = accept_pending_transfer(target_service, file_id, args.target_email)
+                    if accept_status == "accepted":
+                        with lock:
+                            stats["accepted"] += 1
+                        print(f"{'accepted':14} {path_str}", flush=True)
+                        return
+                except HttpError as accept_err:
+                    with lock:
+                        stats["errors"] += 1
+                        failures.append(f"{path_str} ({file_id}): accept-after-insufficient: {accept_err}")
+                    print(f"error          {path_str}: accept-after-insufficient: {accept_err}", flush=True)
+                    return
 
-    print("\nSummary:")
+            with lock:
+                stats["errors"] += 1
+                failures.append(f"{path_str} ({file_id}): {err}")
+            print(f"error          {path_str}: {err}", flush=True)
+
+    with ThreadPoolExecutor(max_workers=args.workers) as executor:
+        futures = [executor.submit(worker, fid, path) for fid, path in work_items]
+        for _ in as_completed(futures):
+            pass
+
+    print("\nSummary:", flush=True)
     for key, label in [
         ("scanned", "Files scanned"),
         ("transferred", "Ownership transferred"),
@@ -346,12 +491,12 @@ def main():
         ("skipped_zero_size", "Skipped (size 0)"),
         ("errors", "Errors"),
     ]:
-        print(f"- {label}: {stats[key]}")
+        print(f"- {label}: {stats[key]}", flush=True)
 
     if failures:
-        print("\nFailures:")
+        print("\nFailures:", flush=True)
         for item in failures:
-            print(f"- {item}")
+            print(f"- {item}", flush=True)
 
 
 if __name__ == "__main__":
